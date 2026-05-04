@@ -13,6 +13,71 @@ export interface GenerateOptions {
   srcPrefix?: string;
 }
 
+// ---- workspace detection ----
+
+function parsePnpmWorkspaceYaml(yaml: string): string[] {
+  const patterns: string[] = [];
+  let inPackages = false;
+  for (const line of yaml.split("\n")) {
+    if (line.trim() === "packages:") { inPackages = true; continue; }
+    if (inPackages) {
+      const match = line.match(/^\s+-\s+['"]?([^'"#\s]+)['"]?/);
+      if (match) patterns.push(match[1]);
+      else if (line.trim() && !line.match(/^\s/)) inPackages = false;
+    }
+  }
+  return patterns;
+}
+
+function expandWorkspacePatterns(rootDir: string, patterns: string[]): string[] {
+  const results: string[] = [];
+  for (const pattern of patterns) {
+    if (pattern.endsWith("/*")) {
+      const dir = join(rootDir, pattern.slice(0, -2));
+      if (!existsSync(dir)) continue;
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue;
+        const pkgDir = join(dir, entry.name);
+        if (existsSync(join(pkgDir, "package.json"))) results.push(pkgDir);
+      }
+    } else {
+      const dir = join(rootDir, pattern);
+      if (existsSync(dir) && existsSync(join(dir, "package.json"))) results.push(dir);
+    }
+  }
+  return results;
+}
+
+function detectWorkspacePackages(rootDir: string): string[] | null {
+  const pnpmYaml = join(rootDir, "pnpm-workspace.yaml");
+  if (existsSync(pnpmYaml)) {
+    const patterns = parsePnpmWorkspaceYaml(readFileSync(pnpmYaml, "utf8"));
+    const pkgs = expandWorkspacePatterns(rootDir, patterns);
+    if (pkgs.length > 0) return pkgs;
+  }
+  const pkgPath = join(rootDir, "package.json");
+  if (existsSync(pkgPath)) {
+    try {
+      const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as Record<string, unknown>;
+      const workspaces = pkg["workspaces"];
+      if (Array.isArray(workspaces)) {
+        const pkgs = expandWorkspacePatterns(rootDir, workspaces as string[]);
+        if (pkgs.length > 0) return pkgs;
+      }
+    } catch { /* ignore */ }
+  }
+  return null;
+}
+
+function getPackageName(pkgDir: string): string | null {
+  try {
+    const pkg = JSON.parse(readFileSync(join(pkgDir, "package.json"), "utf8")) as Record<string, unknown>;
+    return (pkg["name"] as string) ?? null;
+  } catch { return null; }
+}
+
+// ---- tsconfig / entry detection ----
+
 function detectRootDir(targetDir: string): string {
   const tsconfigPath = join(targetDir, "tsconfig.json");
   if (existsSync(tsconfigPath)) {
@@ -48,17 +113,16 @@ function detectEntry(targetDir: string): string {
     if (types) return pathToEntry(types, rootDir);
     const main = pkg["main"] as string | undefined;
     if (main) return pathToEntry(main, rootDir);
-  } catch {
-    // ignore parse errors
-  }
+  } catch { /* ignore */ }
   return "index";
 }
 
 function detectSrcPrefix(targetDir: string): string {
   const rootDir = detectRootDir(targetDir);
-  if (rootDir && rootDir !== ".") return `./${rootDir}/`;
-  return "./";
+  return rootDir && rootDir !== "." ? `./${rootDir}/` : "./";
 }
+
+// ---- AST helpers ----
 
 function findDecl(sf: ts.SourceFile, name: string): ts.Node | null {
   for (const stmt of sf.statements) {
@@ -93,33 +157,11 @@ function collectDtsFiles(dir: string): string[] {
   return results.sort();
 }
 
-function scanAllFiles(
-  tmp: string,
-  srcPrefix: string,
-  printer: ts.Printer,
-): string[] {
-  const out: string[] = [];
-  for (const filePath of collectDtsFiles(tmp)) {
-    const rel = relative(tmp, filePath).replace(/\.d\.ts$/, "");
-    const sf = ts.createSourceFile(
-      rel + ".d.ts",
-      readFileSync(filePath, "utf8"),
-      ts.ScriptTarget.ES2022,
-      true,
-    );
-    const exported = sf.statements.filter(isExported);
-    if (exported.length === 0) continue;
-    out.push("", `// ${srcPrefix}${rel}.ts`);
-    for (const stmt of exported) {
-      out.push(printer.printNode(ts.EmitHint.Unspecified, stmt, sf).trim());
-    }
-  }
-  return out;
-}
+// ---- core generation (single package, returns lines without header) ----
 
-export function generateSurface(options: GenerateOptions = {}): string {
-  const targetDir = options.targetDir ?? process.cwd();
+function generatePackageLines(targetDir: string, options: GenerateOptions): string[] {
   const srcPrefix = options.srcPrefix ?? detectSrcPrefix(targetDir);
+  const out: string[] = [];
 
   const tmp = mkdtempSync(join(tmpdir(), "typegist-"));
   try {
@@ -128,12 +170,9 @@ export function generateSurface(options: GenerateOptions = {}): string {
         `npx --no-install tsc --emitDeclarationOnly --declaration --declarationMap false --noEmit false --noEmitOnError false --outDir "${tmp}"`,
         { cwd: targetDir, stdio: ["ignore", "ignore", "pipe"] },
       );
-    } catch {
-      // tsc exits non-zero on type errors but still emits when noEmitOnError is false
-    }
+    } catch { /* tsc exits non-zero on type errors but still emits */ }
 
     const printer = ts.createPrinter({ removeComments: true, newLine: ts.NewLineKind.LineFeed });
-    const out: string[] = ["// Generated by typegist — do not edit manually.", ""];
 
     // Library mode: follow re-exports from a single entry point
     const entry = options.entry ?? detectEntry(targetDir);
@@ -168,10 +207,7 @@ export function generateSurface(options: GenerateOptions = {}): string {
           const fp = join(tmp, rel + ".d.ts");
           if (!existsSync(fp)) return null;
           const sf = ts.createSourceFile(
-            rel + ".d.ts",
-            readFileSync(fp, "utf8"),
-            ts.ScriptTarget.ES2022,
-            true,
+            rel + ".d.ts", readFileSync(fp, "utf8"), ts.ScriptTarget.ES2022, true,
           );
           moduleCache.set(rel, sf);
           return sf;
@@ -189,15 +225,46 @@ export function generateSurface(options: GenerateOptions = {}): string {
           if (!decl) { out.push(`// (could not find ${re.name} in ${re.fromRel})`); continue; }
           out.push(printer.printNode(ts.EmitHint.Unspecified, decl, sf).trim());
         }
-
-        return out.join("\n") + "\n";
+        return out;
       }
     }
 
     // App/fallback mode: scan all emitted .d.ts files for exported declarations
-    out.push(...scanAllFiles(tmp, srcPrefix, printer));
-    return out.join("\n") + "\n";
+    for (const filePath of collectDtsFiles(tmp)) {
+      const rel = relative(tmp, filePath).replace(/\.d\.ts$/, "");
+      const sf = ts.createSourceFile(
+        rel + ".d.ts", readFileSync(filePath, "utf8"), ts.ScriptTarget.ES2022, true,
+      );
+      const exported = sf.statements.filter(isExported);
+      if (exported.length === 0) continue;
+      out.push("", `// ${srcPrefix}${rel}.ts`);
+      for (const stmt of exported) {
+        out.push(printer.printNode(ts.EmitHint.Unspecified, stmt, sf).trim());
+      }
+    }
+
+    return out;
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }
+}
+
+// ---- public API ----
+
+export function generateSurface(options: GenerateOptions = {}): string {
+  const targetDir = options.targetDir ?? process.cwd();
+  const out: string[] = ["// Generated by typegist — do not edit manually."];
+
+  const workspacePkgs = detectWorkspacePackages(targetDir);
+  if (workspacePkgs) {
+    for (const pkgDir of workspacePkgs) {
+      const name = getPackageName(pkgDir) ?? relative(targetDir, pkgDir);
+      out.push("", `// ${"=".repeat(5)} ${name} ${"=".repeat(5)}`);
+      out.push(...generatePackageLines(pkgDir, options));
+    }
+  } else {
+    out.push(...generatePackageLines(targetDir, options));
+  }
+
+  return out.join("\n") + "\n";
 }
