@@ -259,8 +259,12 @@ export function generateSurface(options: GenerateOptions = {}): string {
   if (workspacePkgs) {
     for (const pkgDir of workspacePkgs) {
       const name = getPackageName(pkgDir) ?? relative(targetDir, pkgDir);
-      out.push("", `// ${"=".repeat(5)} ${name} ${"=".repeat(5)}`);
-      out.push(...generatePackageLines(pkgDir, options));
+      const lines = generatePackageLines(pkgDir, options);
+      out.push("", `declare module "${name}" {`);
+      out.push(...lines.map((l) =>
+        l === "" ? "" : l.split("\n").map((sub) => (sub === "" ? "" : `  ${sub}`)).join("\n")
+      ));
+      out.push("}");
     }
   } else {
     out.push(...generatePackageLines(targetDir, options));
