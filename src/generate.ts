@@ -13,20 +13,44 @@ export interface GenerateOptions {
   srcPrefix?: string;
 }
 
+function detectRootDir(targetDir: string): string {
+  const tsconfigPath = join(targetDir, "tsconfig.json");
+  if (existsSync(tsconfigPath)) {
+    const result = ts.readConfigFile(tsconfigPath, ts.sys.readFile);
+    if (!result.error) {
+      const rootDir = (result.config as { compilerOptions?: { rootDir?: string } })
+        ?.compilerOptions?.rootDir;
+      if (rootDir) return rootDir.replace(/^\.\//, "").replace(/\/$/, "");
+    }
+  }
+  return existsSync(join(targetDir, "src")) ? "src" : ".";
+}
+
+function pathToEntry(filePath: string, rootDir: string): string {
+  let p = filePath.replace(/^\.\//, "");
+  // Strip common output dirs
+  for (const out of ["dist/", "out/", "build/", "lib/"]) {
+    if (p.startsWith(out)) { p = p.slice(out.length); break; }
+  }
+  // Strip rootDir prefix — tsc emits relative to rootDir
+  if (rootDir && rootDir !== ".") {
+    const prefix = rootDir + "/";
+    if (p.startsWith(prefix)) p = p.slice(prefix.length);
+  }
+  // Strip extensions
+  return p.replace(/\.d\.ts$/, "").replace(/\.[cm]?tsx?$/, "") || "index";
+}
+
 function detectEntry(targetDir: string): string {
+  const rootDir = detectRootDir(targetDir);
   const pkgPath = join(targetDir, "package.json");
   if (!existsSync(pkgPath)) return "index";
   try {
     const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as Record<string, unknown>;
     const types = (pkg["types"] ?? pkg["typings"]) as string | undefined;
-    if (types) {
-      // "./dist/index.d.ts" -> "index"
-      return types.replace(/^\.\//, "").replace(/^dist\//, "").replace(/\.d\.ts$/, "");
-    }
+    if (types) return pathToEntry(types, rootDir);
     const main = pkg["main"] as string | undefined;
-    if (main) {
-      return main.replace(/^\.\//, "").replace(/^dist\//, "").replace(/\.[cm]?js$/, "");
-    }
+    if (main) return pathToEntry(main, rootDir);
   } catch {
     // ignore parse errors
   }
@@ -34,18 +58,8 @@ function detectEntry(targetDir: string): string {
 }
 
 function detectSrcPrefix(targetDir: string): string {
-  const tsconfigPath = join(targetDir, "tsconfig.json");
-  if (existsSync(tsconfigPath)) {
-    const result = ts.readConfigFile(tsconfigPath, ts.sys.readFile);
-    if (!result.error) {
-      const rootDir = (result.config as { compilerOptions?: { rootDir?: string } })
-        ?.compilerOptions?.rootDir;
-      if (rootDir) {
-        return "./" + rootDir.replace(/^\.\//, "").replace(/\/$/, "") + "/";
-      }
-    }
-  }
-  if (existsSync(join(targetDir, "src"))) return "./src/";
+  const rootDir = detectRootDir(targetDir);
+  if (rootDir && rootDir !== ".") return `./${rootDir}/`;
   return "./";
 }
 

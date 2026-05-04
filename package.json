@@ -1,11 +1,12 @@
 {
-  "name": "typegist",
-  "version": "0.1.0",
+  "name": "@kndlt/typegist",
+  "version": "0.1.1",
   "description": "Generate a bird's-eye-view .d.ts of your TypeScript project",
   "type": "module",
   "bin": {
-    "typegist": "./dist/cli.js"
+    "typegist": "dist/cli.js"
   },
+  "types": "./dist/index.d.ts",
   "exports": {
     ".": {
       "import": "./dist/index.js",
