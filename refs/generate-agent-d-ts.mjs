@@ -1,0 +1,214 @@
+#!/usr/bin/env node
+// Generate a compact synthesised AGENTS.d.ts for @sunny-street/engine.
+//
+// Modes:
+//   pnpm generate:agent-d-ts                  Write AGENTS.d.ts and print it to stdout.
+//   pnpm generate:agent-d-ts --quiet          Write file only, no stdout.
+//   pnpm generate:agent-d-ts --no-write       Stdout only (don't touch the file).
+//   node ... --hook=session-start Hook mode: regenerate, print
+//                                 hookSpecificOutput envelope to stdout.
+//   node ... --hook=post-tool-use Hook mode: read tool event from stdin,
+//                                 regenerate + inject only if an engine
+//                                 source file was edited; otherwise no-op.
+//
+// See docs/agent-birds-eye-view.md and AGENTS.md § "Bird's-eye view".
+
+import { execSync } from "node:child_process";
+import { readFileSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
+
+const argv = process.argv.slice(2);
+const args = new Set(argv);
+const hookArg = argv.find((a) => a.startsWith("--hook="));
+const hookMode = hookArg ? hookArg.slice("--hook=".length) : null;
+const quiet = args.has("--quiet");
+const noWrite = args.has("--no-write");
+
+const repoRoot = fileURLToPath(new URL("..", import.meta.url));
+const engineDir = join(repoRoot, "packages", "engine");
+const outFile = join(engineDir, "AGENTS.d.ts");
+
+// typescript is only installed under packages/engine. Resolve from there.
+const requireFromEngine = createRequire(join(engineDir, "package.json"));
+const ts = requireFromEngine("typescript");
+
+/**
+ * Generate the synthesised public surface as a string. Pure: doesn't write
+ * files or read CLI flags. Throws if the engine's index.d.ts can't be parsed.
+ */
+function generateSurface() {
+  const tmp = mkdtempSync(join(tmpdir(), "ss-surface-"));
+  try {
+    // 1. Emit declarations. Tolerate type errors so a partially-broken WIP
+    //    still produces a useful skim.
+    try {
+      execSync(
+        `pnpm exec tsc --emitDeclarationOnly --declaration --declarationMap false --noEmitOnError false --outDir "${tmp}"`,
+        { cwd: engineDir, stdio: ["ignore", "ignore", "pipe"] },
+      );
+    } catch {
+      // tsc exits non-zero on type errors but still emits when noEmitOnError
+      // is false. Stay silent — stderr would pollute the hook output.
+    }
+
+    // 2. Parse public re-exports from index.d.ts.
+    const indexSrc = readFileSync(join(tmp, "index.d.ts"), "utf8");
+    const indexSf = ts.createSourceFile(
+      "index.d.ts",
+      indexSrc,
+      ts.ScriptTarget.ES2022,
+      true,
+    );
+
+    /** @type {{ name: string; isType: boolean; fromRel: string }[]} */
+    const reExports = [];
+    for (const stmt of indexSf.statements) {
+      if (!ts.isExportDeclaration(stmt)) continue;
+      if (!stmt.moduleSpecifier || !stmt.exportClause) continue;
+      if (!ts.isStringLiteral(stmt.moduleSpecifier)) continue;
+      if (!ts.isNamedExports(stmt.exportClause)) continue;
+      const fromRel = stmt.moduleSpecifier.text.replace(/^\.\//, "");
+      const isTypeOnlyDecl = !!stmt.isTypeOnly;
+      for (const el of stmt.exportClause.elements) {
+        const name = (el.propertyName ?? el.name).text;
+        reExports.push({
+          name,
+          isType: isTypeOnlyDecl || !!el.isTypeOnly,
+          fromRel,
+        });
+      }
+    }
+
+    // 3. For each re-export, find its declaration in the leaf module.
+    const printer = ts.createPrinter({
+      removeComments: true,
+      newLine: ts.NewLineKind.LineFeed,
+    });
+    const moduleCache = new Map();
+    function loadModule(rel) {
+      if (moduleCache.has(rel)) return moduleCache.get(rel);
+      const sf = ts.createSourceFile(
+        rel,
+        readFileSync(join(tmp, rel + ".d.ts"), "utf8"),
+        ts.ScriptTarget.ES2022,
+        true,
+      );
+      moduleCache.set(rel, sf);
+      return sf;
+    }
+    function findDecl(sf, name) {
+      for (const stmt of sf.statements) {
+        if (ts.isFunctionDeclaration(stmt) && stmt.name?.text === name)
+          return stmt;
+        if (ts.isClassDeclaration(stmt) && stmt.name?.text === name)
+          return stmt;
+        if (ts.isInterfaceDeclaration(stmt) && stmt.name.text === name)
+          return stmt;
+        if (ts.isTypeAliasDeclaration(stmt) && stmt.name.text === name)
+          return stmt;
+        if (ts.isEnumDeclaration(stmt) && stmt.name.text === name) return stmt;
+        if (ts.isVariableStatement(stmt)) {
+          for (const d of stmt.declarationList.declarations) {
+            if (ts.isIdentifier(d.name) && d.name.text === name) return stmt;
+          }
+        }
+      }
+      return null;
+    }
+
+    // 4. Emit. Group by source module in source order from index.ts.
+    const out = [];
+    out.push(
+      "// AGENTS.d.ts — synthesised public surface of @sunny-street/engine.",
+    );
+    out.push("// Generated by tools/generate-agent-d-ts.mjs. Do not edit.");
+    out.push("// Source of truth is ./src/.");
+    out.push("");
+
+    let lastFrom = null;
+    for (const re of reExports) {
+      if (re.fromRel !== lastFrom) {
+        out.push("");
+        out.push(`// ./src/${re.fromRel}.ts`);
+        lastFrom = re.fromRel;
+      }
+      const sf = loadModule(re.fromRel);
+      const decl = findDecl(sf, re.name);
+      if (!decl) {
+        out.push(`// (could not locate ${re.name} in ${re.fromRel})`);
+        continue;
+      }
+      out.push(printer.printNode(ts.EmitHint.Unspecified, decl, sf).trim());
+    }
+
+    return out.join("\n") + "\n";
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+/** Read all of stdin synchronously. Returns "" if no data. */
+function readStdin() {
+  try {
+    return readFileSync(0, "utf8");
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Look anywhere in tool_input for a string that looks like an engine
+ * source path. Tolerates camelCase/snake_case and nested arrays (e.g.
+ * multi_replace_string_in_file's "replacements").
+ */
+function touchesEngineSource(toolInput) {
+  if (!toolInput) return false;
+  return /packages\/engine\/src\//.test(JSON.stringify(toolInput));
+}
+
+const PREAMBLE_SESSION =
+  "Synthesised public surface of @sunny-street/engine, regenerated at session start. " +
+  "Source of truth is packages/engine/src/. Generated file at packages/engine/AGENTS.d.ts. " +
+  "To refresh during the session, run `pnpm generate:agent-d-ts`.";
+
+const PREAMBLE_POST =
+  "Engine source was edited. Refreshed synthesised public surface follows.";
+
+function emitEnvelope(eventName, body) {
+  process.stdout.write(
+    JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: eventName,
+        additionalContext: body,
+      },
+    }),
+  );
+}
+
+if (hookMode === "session-start") {
+  const surface = generateSurface();
+  writeFileSync(outFile, surface);
+  emitEnvelope("SessionStart", `${PREAMBLE_SESSION}\n\n${surface}`);
+} else if (hookMode === "post-tool-use") {
+  const stdin = readStdin();
+  let event = null;
+  try {
+    event = JSON.parse(stdin);
+  } catch {
+    process.exit(0);
+  }
+  if (!touchesEngineSource(event?.tool_input)) {
+    // Not an engine edit — stay silent, fast path.
+    process.exit(0);
+  }
+  const surface = generateSurface();
+  writeFileSync(outFile, surface);
+  emitEnvelope("PostToolUse", `${PREAMBLE_POST}\n\n${surface}`);
+} else {
+  const surface = generateSurface();
+  if (!noWrite) writeFileSync(outFile, surface);
+  if (!quiet) process.stdout.write(surface);
+}
