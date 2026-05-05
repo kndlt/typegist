@@ -16,6 +16,9 @@ function parseArgs(args: string[]) {
     noWrite: flags.has("--no-write"),
     hook: get("--hook=") ?? null,
     help: flags.has("--help") || flags.has("-h"),
+    symbolNamesOnly: flags.has("--symbol-names-only"),
+    format: get("--format="),
+    symbol: get("--symbol="),
   };
 }
 
@@ -50,6 +53,9 @@ Options:
   --out=<file>        Write output to this file
   --entry=<name>      Entry module name without extension (default: auto-detected)
   --src-prefix=<str>  Prefix shown in source path comments (default: auto-detected)
+  --format=<fmt>      Output format: dts (default), names, yaml
+  --symbol-names-only Shorthand for --format=names
+  --symbol=<name>     Emit only the full declaration for a single symbol
   --quiet             Write file only, suppress stdout
   --no-write          Print to stdout only, do not write file
   --hook=<event>      Claude Code hook mode: session-start | post-tool-use
@@ -63,10 +69,14 @@ if (opts.help) {
   process.exit(0);
 }
 
+const resolvedFormat = opts.symbolNamesOnly ? "names" : (opts.format as "dts" | "names" | "yaml" | undefined);
+
 const generateOpts = {
   targetDir: opts.dir,
   ...(opts.entry ? { entry: opts.entry } : {}),
   ...(opts.srcPrefix ? { srcPrefix: opts.srcPrefix } : {}),
+  ...(resolvedFormat ? { format: resolvedFormat } : {}),
+  ...(opts.symbol ? { symbol: opts.symbol } : {}),
 };
 
 if (opts.hook === "session-start") {

@@ -11,6 +11,21 @@ export interface GenerateOptions {
   entry?: string;
   /** Source path prefix shown in comments, e.g. "./src/" (default: auto-detected from tsconfig rootDir) */
   srcPrefix?: string;
+  /** Emit only the full declaration for this symbol name */
+  symbol?: string;
+  /** Output format: full declarations (default), names-only, or YAML tree */
+  format?: "dts" | "names" | "yaml";
+}
+
+export interface FileExport {
+  name: string;
+  text: string;
+}
+
+export interface FileSymbols {
+  /** Relative path without leading "./" and without ".ts" — e.g. "src/state/contracts/index" */
+  file: string;
+  exports: FileExport[];
 }
 
 // ---- workspace detection ----
@@ -125,11 +140,8 @@ function detectSrcPrefix(targetDir: string): string {
 // After tsc emits, infer the actual srcPrefix by checking whether the
 // emitted files are flat (rootDir=src) or nested (rootDir=.).
 function inferSrcPrefix(targetDir: string, tmp: string): string {
-  // If a known source file appears flat in tmp, rootDir was src.
-  // If it appears nested under src/, rootDir was the project root.
   const srcDir = join(targetDir, "src");
   if (!existsSync(srcDir)) return "./";
-  // Look for any .d.ts at tmp/src/*.d.ts — means rootDir was "."
   try {
     const entries = readdirSync(tmp, { withFileTypes: true });
     const hasSrcSubdir = entries.some((e) => e.isDirectory() && e.name === "src");
@@ -140,6 +152,21 @@ function inferSrcPrefix(targetDir: string, tmp: string): string {
 }
 
 // ---- AST helpers ----
+
+function getDeclName(stmt: ts.Statement): string | null {
+  if (ts.isFunctionDeclaration(stmt)) return stmt.name?.text ?? null;
+  if (ts.isClassDeclaration(stmt)) return stmt.name?.text ?? null;
+  if (ts.isInterfaceDeclaration(stmt)) return stmt.name.text;
+  if (ts.isTypeAliasDeclaration(stmt)) return stmt.name.text;
+  if (ts.isEnumDeclaration(stmt)) return stmt.name.text;
+  if (ts.isVariableStatement(stmt)) {
+    const names = stmt.declarationList.declarations
+      .map((d) => (ts.isIdentifier(d.name) ? d.name.text : null))
+      .filter((n): n is string => n !== null);
+    return names.join(", ");
+  }
+  return null;
+}
 
 function findDecl(sf: ts.SourceFile, name: string): ts.Node | null {
   for (const stmt of sf.statements) {
@@ -173,7 +200,7 @@ function stripImportPaths(src: string): string {
 function collectDtsFiles(dir: string, root = dir): string[] {
   const results: string[] = [];
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
-    if (entry.name.startsWith(".")) continue; // skip hidden dirs (.next, .git, etc.)
+    if (entry.name.startsWith(".")) continue;
     const full = join(dir, entry.name);
     if (entry.isDirectory()) {
       if (SKIP_DIRS.has(entry.name)) continue;
@@ -189,11 +216,10 @@ function collectDtsFiles(dir: string, root = dir): string[] {
   return results.sort();
 }
 
-// ---- core generation (single package, returns lines without header) ----
+// ---- core collection ----
 
-function generatePackageLines(targetDir: string, options: GenerateOptions): string[] {
-  const out: string[] = [];
-
+function collectPackageSymbols(targetDir: string, options: GenerateOptions): FileSymbols[] {
+  const results: FileSymbols[] = [];
   const tmp = mkdtempSync(join(tmpdir(), "typegist-"));
   try {
     try {
@@ -204,6 +230,7 @@ function generatePackageLines(targetDir: string, options: GenerateOptions): stri
     } catch { /* tsc exits non-zero on type errors but still emits */ }
 
     const srcPrefix = options.srcPrefix ?? inferSrcPrefix(targetDir, tmp);
+    const normalizedPrefix = srcPrefix.replace(/^\.\//, ""); // "" or "src/"
     const printer = ts.createPrinter({ removeComments: true, newLine: ts.NewLineKind.LineFeed });
 
     // Library mode: follow re-exports from a single entry point
@@ -245,19 +272,29 @@ function generatePackageLines(targetDir: string, options: GenerateOptions): stri
           return sf;
         }
 
-        let lastFrom: string | null = null;
-        for (const re of reExports) {
-          if (re.fromRel !== lastFrom) {
-            out.push("", `// ${srcPrefix}${re.fromRel}.ts`);
-            lastFrom = re.fromRel;
-          }
+        const filtered = options.symbol
+          ? reExports.filter((re) => re.name === options.symbol)
+          : reExports;
+
+        // Group by file, preserving order
+        const fileOrder: string[] = [];
+        const byFile = new Map<string, FileExport[]>();
+        for (const re of filtered) {
+          const file = normalizedPrefix + re.fromRel;
+          if (!byFile.has(file)) { byFile.set(file, []); fileOrder.push(file); }
           const sf = loadModule(re.fromRel);
-          if (!sf) { out.push(`// (could not find module ${re.fromRel})`); continue; }
-          const decl = findDecl(sf, re.name);
-          if (!decl) { out.push(`// (could not find ${re.name} in ${re.fromRel})`); continue; }
-          out.push(stripImportPaths(printer.printNode(ts.EmitHint.Unspecified, decl, sf).trim()));
+          let text = `// (could not find ${re.name})`;
+          if (sf) {
+            const decl = findDecl(sf, re.name);
+            if (decl) text = stripImportPaths(printer.printNode(ts.EmitHint.Unspecified, decl, sf).trim());
+          }
+          byFile.get(file)!.push({ name: re.name, text });
         }
-        return out;
+
+        for (const file of fileOrder) {
+          results.push({ file, exports: byFile.get(file)! });
+        }
+        return results;
       }
     }
 
@@ -267,39 +304,114 @@ function generatePackageLines(targetDir: string, options: GenerateOptions): stri
       const sf = ts.createSourceFile(
         rel + ".d.ts", readFileSync(filePath, "utf8"), ts.ScriptTarget.ES2022, true,
       );
-      const exported = sf.statements.filter(isExported);
-      if (exported.length === 0) continue;
-      out.push("", `// ${srcPrefix}${rel}.ts`);
-      for (const stmt of exported) {
-        out.push(stripImportPaths(printer.printNode(ts.EmitHint.Unspecified, stmt, sf).trim()));
+      let exported = sf.statements.filter(isExported);
+      if (options.symbol) {
+        exported = exported.filter((stmt) => getDeclName(stmt) === options.symbol);
       }
+      if (exported.length === 0) continue;
+
+      const file = normalizedPrefix + rel;
+      const exports: FileExport[] = exported.map((stmt) => ({
+        name: getDeclName(stmt) ?? "",
+        text: stripImportPaths(printer.printNode(ts.EmitHint.Unspecified, stmt, sf).trim()),
+      }));
+      results.push({ file, exports });
     }
 
-    return out;
+    return results;
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }
+}
+
+// ---- serializers ----
+
+function toFlat(files: FileSymbols[], namesOnly: boolean): string[] {
+  const lines: string[] = [];
+  for (const { file, exports } of files) {
+    lines.push("", `// ./${file}.ts`);
+    for (const { name, text } of exports) {
+      lines.push(namesOnly ? name : text);
+    }
+  }
+  return lines;
+}
+
+type YamlTree = { [key: string]: YamlTree | string[] };
+
+function buildYamlTree(files: FileSymbols[]): YamlTree {
+  const root: YamlTree = {};
+  for (const { file, exports } of files) {
+    const parts = file.split("/");
+    let node = root;
+    for (let i = 0; i < parts.length - 1; i++) {
+      const part = parts[i];
+      if (!(part in node) || Array.isArray(node[part])) node[part] = {};
+      node = node[part] as YamlTree;
+    }
+    const leaf = parts[parts.length - 1] + ".ts";
+    node[leaf] = exports.map((e) => e.name);
+  }
+  return root;
+}
+
+function serializeYamlTree(tree: YamlTree, indent = 0): string {
+  const pad = "  ".repeat(indent);
+  const lines: string[] = [];
+  for (const [key, value] of Object.entries(tree)) {
+    if (Array.isArray(value)) {
+      lines.push(`${pad}${key}:`);
+      for (const name of value) lines.push(`${pad}  - ${name}`);
+    } else {
+      lines.push(`${pad}${key}:`);
+      lines.push(serializeYamlTree(value, indent + 1));
+    }
+  }
+  return lines.join("\n");
 }
 
 // ---- public API ----
 
 export function generateSurface(options: GenerateOptions = {}): string {
   const targetDir = options.targetDir ?? process.cwd();
+  const format = options.format ?? "dts";
+  const workspacePkgs = detectWorkspacePackages(targetDir);
+
+  if (format === "yaml") {
+    if (workspacePkgs) {
+      const sections: string[] = [];
+      for (const pkgDir of workspacePkgs) {
+        const name = getPackageName(pkgDir) ?? relative(targetDir, pkgDir);
+        const files = collectPackageSymbols(pkgDir, options);
+        sections.push(`${name}:\n${serializeYamlTree(buildYamlTree(files), 1)}`);
+      }
+      return sections.join("\n") + "\n";
+    }
+    const files = collectPackageSymbols(targetDir, options);
+    return serializeYamlTree(buildYamlTree(files)) + "\n";
+  }
+
+  const namesOnly = format === "names";
   const out: string[] = ["// Generated by typegist — do not edit manually."];
 
-  const workspacePkgs = detectWorkspacePackages(targetDir);
   if (workspacePkgs) {
     for (const pkgDir of workspacePkgs) {
       const name = getPackageName(pkgDir) ?? relative(targetDir, pkgDir);
-      const lines = generatePackageLines(pkgDir, options);
-      out.push("", `declare module "${name}" {`);
-      out.push(...lines.map((l) =>
-        l === "" ? "" : l.split("\n").map((sub) => (sub === "" ? "" : `  ${sub}`)).join("\n")
-      ));
-      out.push("}");
+      const files = collectPackageSymbols(pkgDir, options);
+      const lines = toFlat(files, namesOnly);
+      if (namesOnly) {
+        out.push("", `// module: ${name}`);
+        out.push(...lines);
+      } else {
+        out.push("", `declare module "${name}" {`);
+        out.push(...lines.map((l) =>
+          l === "" ? "" : l.split("\n").map((sub) => (sub === "" ? "" : `  ${sub}`)).join("\n")
+        ));
+        out.push("}");
+      }
     }
   } else {
-    out.push(...generatePackageLines(targetDir, options));
+    out.push(...toFlat(collectPackageSymbols(targetDir, options), namesOnly));
   }
 
   return out.join("\n") + "\n";
