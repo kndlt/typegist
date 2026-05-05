@@ -122,6 +122,23 @@ function detectSrcPrefix(targetDir: string): string {
   return rootDir && rootDir !== "." ? `./${rootDir}/` : "./";
 }
 
+// After tsc emits, infer the actual srcPrefix by checking whether the
+// emitted files are flat (rootDir=src) or nested (rootDir=.).
+function inferSrcPrefix(targetDir: string, tmp: string): string {
+  // If a known source file appears flat in tmp, rootDir was src.
+  // If it appears nested under src/, rootDir was the project root.
+  const srcDir = join(targetDir, "src");
+  if (!existsSync(srcDir)) return "./";
+  // Look for any .d.ts at tmp/src/*.d.ts — means rootDir was "."
+  try {
+    const entries = readdirSync(tmp, { withFileTypes: true });
+    const hasSrcSubdir = entries.some((e) => e.isDirectory() && e.name === "src");
+    return hasSrcSubdir ? "./" : "./src/";
+  } catch {
+    return detectSrcPrefix(targetDir);
+  }
+}
+
 // ---- AST helpers ----
 
 function findDecl(sf: ts.SourceFile, name: string): ts.Node | null {
@@ -147,12 +164,27 @@ function isExported(stmt: ts.Statement): boolean {
   );
 }
 
-function collectDtsFiles(dir: string): string[] {
+const SKIP_DIRS = new Set(["node_modules", "e2e", "__tests__", "test", "tests", "fixtures", "mocks"]);
+
+function stripImportPaths(src: string): string {
+  return src.replace(/import\([^)]+\)\./g, "");
+}
+
+function collectDtsFiles(dir: string, root = dir): string[] {
   const results: string[] = [];
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    if (entry.name.startsWith(".")) continue; // skip hidden dirs (.next, .git, etc.)
     const full = join(dir, entry.name);
-    if (entry.isDirectory()) results.push(...collectDtsFiles(full));
-    else if (entry.name.endsWith(".d.ts")) results.push(full);
+    if (entry.isDirectory()) {
+      if (SKIP_DIRS.has(entry.name)) continue;
+      results.push(...collectDtsFiles(full, root));
+    } else if (
+      entry.name.endsWith(".d.ts") &&
+      !entry.name.endsWith(".test.d.ts") &&
+      !entry.name.endsWith(".spec.d.ts")
+    ) {
+      results.push(full);
+    }
   }
   return results.sort();
 }
@@ -160,7 +192,6 @@ function collectDtsFiles(dir: string): string[] {
 // ---- core generation (single package, returns lines without header) ----
 
 function generatePackageLines(targetDir: string, options: GenerateOptions): string[] {
-  const srcPrefix = options.srcPrefix ?? detectSrcPrefix(targetDir);
   const out: string[] = [];
 
   const tmp = mkdtempSync(join(tmpdir(), "typegist-"));
@@ -172,6 +203,7 @@ function generatePackageLines(targetDir: string, options: GenerateOptions): stri
       );
     } catch { /* tsc exits non-zero on type errors but still emits */ }
 
+    const srcPrefix = options.srcPrefix ?? inferSrcPrefix(targetDir, tmp);
     const printer = ts.createPrinter({ removeComments: true, newLine: ts.NewLineKind.LineFeed });
 
     // Library mode: follow re-exports from a single entry point
@@ -223,7 +255,7 @@ function generatePackageLines(targetDir: string, options: GenerateOptions): stri
           if (!sf) { out.push(`// (could not find module ${re.fromRel})`); continue; }
           const decl = findDecl(sf, re.name);
           if (!decl) { out.push(`// (could not find ${re.name} in ${re.fromRel})`); continue; }
-          out.push(printer.printNode(ts.EmitHint.Unspecified, decl, sf).trim());
+          out.push(stripImportPaths(printer.printNode(ts.EmitHint.Unspecified, decl, sf).trim()));
         }
         return out;
       }
@@ -239,7 +271,7 @@ function generatePackageLines(targetDir: string, options: GenerateOptions): stri
       if (exported.length === 0) continue;
       out.push("", `// ${srcPrefix}${rel}.ts`);
       for (const stmt of exported) {
-        out.push(printer.printNode(ts.EmitHint.Unspecified, stmt, sf).trim());
+        out.push(stripImportPaths(printer.printNode(ts.EmitHint.Unspecified, stmt, sf).trim()));
       }
     }
 
